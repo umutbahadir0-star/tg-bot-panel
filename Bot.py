@@ -21,7 +21,7 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
                     id INTEGER PRIMARY KEY,
                     message TEXT DEFAULT 'Merhaba, bu otomatik mesajdır.',
-                    interval_minutes INTEGER DEFAULT 60
+                    interval_seconds INTEGER DEFAULT 3600
                 )""")
     c.execute("""CREATE TABLE IF NOT EXISTS chats (
                     chat_id INTEGER PRIMARY KEY,
@@ -34,7 +34,7 @@ def init_db():
 
 def get_settings():
     conn = sqlite3.connect(DB)
-    row = conn.execute("SELECT message, interval_minutes FROM settings WHERE id=1").fetchone()
+    row = conn.execute("SELECT message, interval_seconds FROM settings WHERE id=1").fetchone()
     conn.close()
     return row
 
@@ -44,9 +44,9 @@ def update_message(text):
     conn.commit()
     conn.close()
 
-def update_interval(minutes):
+def update_interval(seconds):
     conn = sqlite3.connect(DB)
-    conn.execute("UPDATE settings SET interval_minutes=? WHERE id=1", (minutes,))
+    conn.execute("UPDATE settings SET interval_seconds=? WHERE id=1", (seconds,))
     conn.commit()
     conn.close()
 
@@ -83,10 +83,10 @@ async def send_to_all():
 def restart_scheduler():
     scheduler.remove_all_jobs()
     _, interval = get_settings()
-    scheduler.add_job(send_to_all, "interval", minutes=interval, id="main_job")
+    scheduler.add_job(send_to_all, "interval", seconds=interval, id="main_job")
     if not scheduler.running:
         scheduler.start()
-    print(f"Zamanlayici → her {interval} dakikada bir")
+    print(f"Zamanlayici → her {interval} saniyede bir")
 
 app = FastAPI()
 
@@ -119,7 +119,7 @@ HTML = """
 <div class="container">
     <h1>Bot Yönetim Paneli</h1>
     <p class="sub">Mesaj, aralık ve grupları buradan yönet</p>
-    <div class="status">● Sistem çalışıyor · Aralık: {interval} dk</div>
+    <div class="status">● Sistem çalışıyor · Aralık: {interval} sn</div>
     <div class="card">
         <h2>Gönderilecek Mesaj</h2>
         <form method="post" action="/set_message">
@@ -128,9 +128,9 @@ HTML = """
         </form>
     </div>
     <div class="card">
-        <h2>Gönderim Aralığı (dakika)</h2>
+        <h2>Gönderim Aralığı (saniye)</h2>
         <form method="post" action="/set_interval">
-            <input type="number" name="minutes" value="{interval}" min="1" required>
+            <input type="number" name="seconds" value="{interval}" min="1" required>
             <button type="submit">Aralığı Güncelle</button>
         </form>
     </div>
@@ -179,8 +179,8 @@ async def set_message(message: str = Form(...)):
     return RedirectResponse("/", status_code=303)
 
 @app.post("/set_interval")
-async def set_interval(minutes: int = Form(...)):
-    update_interval(max(1, minutes))
+async def set_interval(seconds: int = Form(...)):
+    update_interval(max(1, seconds))
     restart_scheduler()
     return RedirectResponse("/", status_code=303)
 
