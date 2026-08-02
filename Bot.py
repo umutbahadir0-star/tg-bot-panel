@@ -23,6 +23,7 @@ application = None
 
 flood_tracker = {}       # {(chat_id, user_id): [timestamp, ...]}
 duplicate_tracker = {}   # {(chat_id, user_id): (last_text, tekrar_sayisi)}
+blackjack_games = {}     # {(chat_id, user_id): {...}}
 
 LINK_RE = re.compile(r"(https?://|t\.me/|www\.)", re.IGNORECASE)
 PHONE_RE = re.compile(r"[\d][\d\s\-\(\)]{7,}\d")
@@ -257,6 +258,17 @@ def bump_xp(chat_id, user_id, username, amount=1):
     conn.close()
 
 
+def set_xp_absolute(chat_id, user_id, username, amount):
+    conn = sqlite3.connect(DB)
+    conn.execute(
+        "INSERT INTO xp (chat_id, user_id, username, xp) VALUES (?,?,?,?) "
+        "ON CONFLICT(chat_id, user_id) DO UPDATE SET xp = excluded.xp, username = excluded.username",
+        (chat_id, user_id, username, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_xp(chat_id, user_id):
     conn = sqlite3.connect(DB)
     row = conn.execute("SELECT xp FROM xp WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
@@ -380,27 +392,92 @@ async def is_admin(context, chat_id, user_id):
 
 
 # ==================== Ortak ceza sistemi ====================
-async def punish_user(context, chat_id, user, reason):
-    """Flood, spam, yasaklı kelime, link ihlali için ortak ceza. Uyarı arttıkça mute süresi katlanır."""
-    if await is_admin(context, chat_id, user.id):
-        return
-    s = get_settings()
-    bump_warn_count(chat_id, user.id)
-    warns = get_warn_count(chat_id, user.id)
-    mute_minutes = min(s["flood_mute_minutes"] * warns, 1440)
-    until = datetime.now() + timedelta(minutes=mute_minutes)
+async def force_restrict(context, chat_id, user, until):
+    """Kullanıcıyı yetkili (administrator) bile olsa susturmaya zorlar.
+    Telegram, bot ne kadar yetkili olursa olsun bir 'administrator'ı doğrudan
+    susturmaya izin vermez; bu yüzden önce yetkisini geçici olarak kaldırıyoruz.
+    Grup sahibi (creator) hiçbir şekilde susturulamaz, bu Telegram'ın kendi kısıtlaması."""
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+    except Exception as e:
+        member = None
+        print(f"Üye bilgisi alınamadı: {e}")
+
+    if member and member.status == "creator":
+        return False
+
+    if member and member.status == "administrator":
+        try:
+            await context.bot.promote_chat_member(
+                chat_id, user.id,
+                can_change_info=False, can_delete_messages=False, can_invite_users=False,
+                can_restrict_members=False, can_pin_messages=False, can_promote_members=False,
+                can_manage_chat=False, can_manage_video_chats=False,
+            )
+        except Exception as e:
+            print(f"Yetki geçici kaldırma hatası (bot yeterli izne sahip olmayabilir): {e}")
+
     try:
         await context.bot.restrict_chat_member(
             chat_id, user.id,
             permissions=ChatPermissions(can_send_messages=False),
             until_date=until
         )
-        await context.bot.send_message(
-            chat_id,
-            f"🚨 {user.first_name} {reason} için {mute_minutes} dakika susturuldu. (Uyarı: {warns})"
-        )
+        return True
     except Exception as e:
-        print(f"Ceza hatası: {e}")
+        print(f"Susturma hatası: {e}")
+        return False
+
+
+async def punish_user(context, chat_id, user, reason):
+    """Yasaklı kelime, link ihlali için ceza. Uyarı arttıkça mute süresi katlanır. Yetkililer dahil herkese uygulanır."""
+    s = get_settings()
+    bump_warn_count(chat_id, user.id)
+    warns = get_warn_count(chat_id, user.id)
+    mute_minutes = min(s["flood_mute_minutes"] * warns, 1440)
+    until = datetime.now() + timedelta(minutes=mute_minutes)
+    ok = await force_restrict(context, chat_id, user, until)
+    try:
+        if ok:
+            await context.bot.send_message(
+                chat_id,
+                f"🚨 {user.first_name} {reason} için {mute_minutes} dakika susturuldu. (Uyarı: {warns})"
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {user.first_name} grup sahibi olduğu için susturulamadı, ihlal yine de kaydedildi."
+            )
+    except Exception as e:
+        print(f"Mesaj gönderme hatası: {e}")
+
+
+async def punish_spam(context, chat_id, user, message_ids):
+    """Flood/spam için: tüm son mesajları siler ve sabit 10 dakika susturur. Yetkililer dahil herkese uygulanır."""
+    for mid in message_ids:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception as e:
+            print(f"Spam mesajı silme hatası: {e}")
+
+    bump_warn_count(chat_id, user.id)
+    warns = get_warn_count(chat_id, user.id)
+    mute_minutes = 10
+    until = datetime.now() + timedelta(minutes=mute_minutes)
+    ok = await force_restrict(context, chat_id, user, until)
+    try:
+        if ok:
+            await context.bot.send_message(
+                chat_id,
+                f"🚨 {user.first_name} spam/flood yaptığı için tüm mesajları silindi ve {mute_minutes} dakika susturuldu. (Uyarı: {warns})"
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {user.first_name} grup sahibi olduğu için susturulamadı, spam mesajları yine de silindi."
+            )
+    except Exception as e:
+        print(f"Mesaj gönderme hatası: {e}")
 
 
 async def check_flood(update, context):
@@ -412,29 +489,32 @@ async def check_flood(update, context):
 
     key = (chat_id, user.id)
     now = datetime.now().timestamp()
-    times = [t for t in flood_tracker.get(key, []) if now - t <= window]
-    times.append(now)
-    flood_tracker[key] = times
+    entries = [e for e in flood_tracker.get(key, []) if now - e[0] <= window]
+    entries.append((now, msg.message_id))
+    flood_tracker[key] = entries
 
     text = (msg.text or msg.caption or "").strip()
     is_dup_spam = False
+    dup_ids = []
     if text:
         last = duplicate_tracker.get(key)
         if last and last[0] == text:
             count = last[1] + 1
-            duplicate_tracker[key] = (text, count)
+            ids = last[2] + [msg.message_id]
+            duplicate_tracker[key] = (text, count, ids)
             if count >= 3:
                 is_dup_spam = True
+                dup_ids = ids
         else:
-            duplicate_tracker[key] = (text, 1)
+            duplicate_tracker[key] = (text, 1, [msg.message_id])
 
-    if len(times) < limit and not is_dup_spam:
+    if len(entries) < limit and not is_dup_spam:
         return
 
+    message_ids = dup_ids if is_dup_spam else [e[1] for e in entries]
     flood_tracker[key] = []
-    duplicate_tracker[key] = ("", 0)
-    reason = "aynı mesajı tekrarladığı (spam)" if is_dup_spam else "flood yaptığı"
-    await punish_user(context, chat_id, user, reason)
+    duplicate_tracker[key] = ("", 0, [])
+    await punish_spam(context, chat_id, user, message_ids)
 
 
 # ==================== Genel mesaj handler'ı ====================
@@ -470,60 +550,111 @@ async def universal_handler(update, context):
             return
 
     if msg.chat.type in ("group", "supergroup"):
+        # NOT: Aşağıdaki kurallar artık yetkililer dahil HERKESE uygulanır.
         if msg.text and contains_phone_number(msg.text):
-            if not await is_admin(context, msg.chat_id, msg.from_user.id):
-                try:
-                    await msg.delete()
-                except Exception as e:
-                    print(f"Telefon numarası silme hatası: {e}")
-                try:
-                    await context.bot.send_message(
-                        msg.chat_id,
-                        f"🚫 {msg.from_user.first_name}, telefon numarası paylaşımı yasak. Mesajın silindi."
-                    )
-                except Exception as e:
-                    print(f"Uyarı gönderme hatası: {e}")
-                return
+            try:
+                await msg.delete()
+            except Exception as e:
+                print(f"Telefon numarası silme hatası: {e}")
+            try:
+                await context.bot.send_message(
+                    msg.chat_id,
+                    f"🚫 {msg.from_user.first_name}, telefon numarası paylaşımı yasak. Mesajın silindi."
+                )
+            except Exception as e:
+                print(f"Uyarı gönderme hatası: {e}")
+            return
 
         entities = list(msg.entities or []) + list(msg.caption_entities or [])
         if any(e.type in ("mention", "text_mention") for e in entities):
-            if not await is_admin(context, msg.chat_id, msg.from_user.id):
-                try:
-                    await msg.delete()
-                except Exception as e:
-                    print(f"Etiket silme hatası: {e}")
-                return
+            try:
+                await msg.delete()
+            except Exception as e:
+                print(f"Etiket silme hatası: {e}")
+            return
 
         if msg.text and LINK_RE.search(msg.text):
-            if not await is_admin(context, msg.chat_id, msg.from_user.id):
-                try:
-                    await msg.delete()
-                except Exception as e:
-                    print(f"Link silme hatası: {e}")
-                await punish_user(context, msg.chat_id, msg.from_user, "izinsiz link paylaştığı")
-                return
+            try:
+                await msg.delete()
+            except Exception as e:
+                print(f"Link silme hatası: {e}")
+            await punish_user(context, msg.chat_id, msg.from_user, "izinsiz link paylaştığı")
+            return
 
         banned = get_banned_words()
         if banned and msg.text and contains_banned_word(msg.text, banned):
-            if not await is_admin(context, msg.chat_id, msg.from_user.id):
-                try:
-                    await msg.delete()
-                except Exception as e:
-                    print(f"Kelime silme hatası: {e}")
-                await punish_user(context, msg.chat_id, msg.from_user, "yasaklı kelime kullandığı")
-                return
+            try:
+                await msg.delete()
+            except Exception as e:
+                print(f"Kelime silme hatası: {e}")
+            await punish_user(context, msg.chat_id, msg.from_user, "yasaklı kelime kullandığı")
+            return
 
         await check_flood(update, context)
 
     if msg.text and not msg.text.startswith("/"):
         bump_xp(msg.chat_id, msg.from_user.id, msg.from_user.username or msg.from_user.first_name, 1)
 
-    if msg.photo or msg.sticker:
+    if msg.photo or msg.sticker or msg.video or msg.animation or msg.video_note:
         try:
             await msg.delete()
             print(f"Silindi → chat {msg.chat_id}, kullanıcı {msg.from_user.id}")
         except Exception as e:
             print(f"Silme hatası: {e}")
+
+
+# ==================== /id ====================
+async def cmd_id(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target = msg.reply_to_message.from_user
+        await msg.reply_text(
+            f"🆔 Kullanıcı: {target.first_name}\n"
+            f"Kullanıcı ID: <code>{target.id}</code>\n"
+            f"Kullanıcı adı: @{target.username if target.username else 'yok'}\n"
+            f"Sohbet ID: <code>{chat_id}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        user = msg.from_user
+        await msg.reply_text(
+            f"🆔 Senin ID: <code>{user.id}</code>\n"
+            f"Sohbet ID: <code>{chat_id}</code>",
+            parse_mode="HTML"
+        )
+
+
+# ==================== /bilgi ====================
+BILGI_TEXT = (
+    "ℹ️ <b>Oyunlar ve XP Rehberi</b>\n\n"
+    "<b>XP nasıl kazanılır?</b>\n"
+    "• Grupta normal mesaj (komut olmayan) yazmak → +1 XP\n"
+    "• 🔢 /sayitahmin — sayıyı bilirsen → +20 XP\n"
+    "• 🎰 /slot — 3 sembol tutarsa → +15 XP\n"
+    "• 🃏 /blackjack — krupiyeyi yenersen → +20 XP (ilk elde 21 yaparsan +25 XP)\n\n"
+    "<b>Seviye sistemi</b>\n"
+    "Her 100 XP bir seviye. /seviye yazarak kendi (veya reply attığın kişinin) "
+    "XP'sini ve seviyesini görebilirsin. /liderlik ile grubun sıralamasına bakabilirsin.\n\n"
+    "<b>Oyunlar</b>\n"
+    "🎮 <code>/xox</code> — birinin mesajına reply atıp yaz, XOX (tic-tac-toe) başlar\n"
+    "🤖 <code>/xox ai</code> — yapay zekaya karşı XOX\n"
+    "🔚 <code>/xoxbitir</code> — devam eden XOX'u iptal eder\n"
+    "🎲 <code>/zar</code> — zar atar\n"
+    "🪙 <code>/yazitura</code> — yazı tura atar\n"
+    "🎰 <code>/slot</code> — slot makinesi çevirir\n"
+    "🃏 <code>/blackjack</code> — krupiyeye karşı blackjack başlatır (Kart Çek / Dur butonlarıyla oynanır)\n"
+    "🔚 <code>/blackjackbitir</code> — devam eden eli iptal eder\n"
+    "🔢 <code>/sayitahmin</code> — 1-100 arası sayı tahmin oyunu başlatır\n"
+    "🔚 <code>/sayitahminbitir</code> — sayı tahmin oyununu iptal eder\n\n"
+    "<b>Diğer</b>\n"
+    "🆔 <code>/id</code> — kendi ID'ni (veya reply attığın kişinin ID'sini) gösterir\n"
+    "📊 <code>/gunluk</code>, <code>/aylik</code> — mesaj istatistikleri"
+)
+
+
+async def cmd_bilgi(update, context):
+    await update.message.reply_text(BILGI_TEXT, parse_mode="HTML")
 
 
 # ==================== /mute ====================
@@ -728,6 +859,169 @@ async def cmd_sayitahmin_bitir(update, context):
         await update.message.reply_text(f"Oyun iptal edildi. Doğru sayı {game['target']} idi.")
     else:
         await update.message.reply_text("Devam eden bir sayı tahmin oyunu yok.")
+
+
+# ==================== /slot ====================
+SLOT_JACKPOT_VALUES = (1, 22, 43, 64)  # Telegram'ın 🎰 dice değerlerinde 3 sembol eşleşmesi
+
+
+async def cmd_slot(update, context):
+    msg = update.message
+    dice_msg = await context.bot.send_dice(chat_id=msg.chat_id, emoji="🎰")
+    await asyncio.sleep(2.2)
+    value = dice_msg.dice.value
+    if value in SLOT_JACKPOT_VALUES:
+        bump_xp(msg.chat_id, msg.from_user.id, msg.from_user.username or msg.from_user.first_name, 15)
+        await msg.reply_text(f"🎉 JACKPOT! {msg.from_user.first_name} 3 sembol tuttu! (+15 XP)")
+    else:
+        await msg.reply_text("😅 Tutmadı, tekrar dene!")
+
+
+# ==================== /blackjack ====================
+SUITS = ["♠️", "♥️", "♦️", "♣️"]
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+
+def new_deck():
+    deck = [(r, s) for s in SUITS for r in RANKS]
+    random.shuffle(deck)
+    return deck
+
+
+def card_value(rank):
+    if rank == "A":
+        return 11
+    if rank in ("J", "Q", "K"):
+        return 10
+    return int(rank)
+
+
+def hand_value(hand):
+    total = sum(card_value(r) for r, s in hand)
+    aces = sum(1 for r, s in hand if r == "A")
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def hand_str(hand):
+    return " ".join(f"{r}{s}" for r, s in hand)
+
+
+def bj_keyboard(chat_id, user_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🃏 Kart Çek", callback_data=f"bj:{chat_id}:{user_id}:hit"),
+        InlineKeyboardButton("✋ Dur", callback_data=f"bj:{chat_id}:{user_id}:stand"),
+    ]])
+
+
+def bj_status_text(player, dealer, dealer_hidden=True):
+    if dealer_hidden:
+        dealer_str = f"{dealer[0][0]}{dealer[0][1]} 🂠"
+        dealer_val = "?"
+    else:
+        dealer_str = hand_str(dealer)
+        dealer_val = hand_value(dealer)
+    return (f"🃏 Blackjack\n\n"
+            f"Krupiye: {dealer_str} (Toplam: {dealer_val})\n"
+            f"Sen: {hand_str(player)} (Toplam: {hand_value(player)})")
+
+
+async def cmd_blackjack(update, context):
+    msg = update.message
+    key = (msg.chat_id, msg.from_user.id)
+    if key in blackjack_games:
+        await msg.reply_text("Zaten devam eden bir blackjack elin var. Bitirmek için /blackjackbitir yaz.")
+        return
+    deck = new_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+    blackjack_games[key] = {"deck": deck, "player": player, "dealer": dealer}
+
+    if hand_value(player) == 21:
+        del blackjack_games[key]
+        bump_xp(msg.chat_id, msg.from_user.id, msg.from_user.username or msg.from_user.first_name, 25)
+        await msg.reply_text(
+            f"🎉 BLACKJACK! {msg.from_user.first_name} ilk elde 21 yaptı! (+25 XP)\n\n"
+            f"Senin elin: {hand_str(player)}\nKrupiye: {hand_str(dealer)}"
+        )
+        return
+
+    await msg.reply_text(bj_status_text(player, dealer), reply_markup=bj_keyboard(msg.chat_id, msg.from_user.id))
+
+
+async def cmd_blackjack_bitir(update, context):
+    key = (update.message.chat_id, update.message.from_user.id)
+    if key in blackjack_games:
+        del blackjack_games[key]
+        await update.message.reply_text("Blackjack eli iptal edildi.")
+    else:
+        await update.message.reply_text("Devam eden bir blackjack elin yok.")
+
+
+async def bj_finish(query, key, player, dealer, deck, chat_id, user_id, first_name, username):
+    while hand_value(dealer) < 17:
+        dealer.append(deck.pop())
+
+    pv, dv = hand_value(player), hand_value(dealer)
+    if pv > 21:
+        result = f"💥 Battın! ({pv}) Krupiye kazandı."
+    elif dv > 21:
+        bump_xp(chat_id, user_id, username or first_name, 20)
+        result = f"🎉 Krupiye battı ({dv})! Kazandın! (+20 XP)"
+    elif pv > dv:
+        bump_xp(chat_id, user_id, username or first_name, 20)
+        result = f"🎉 Kazandın! Sen: {pv} · Krupiye: {dv} (+20 XP)"
+    elif pv < dv:
+        result = f"😔 Kaybettin. Sen: {pv} · Krupiye: {dv}"
+    else:
+        result = f"🤝 Berabere! ({pv})"
+
+    del blackjack_games[key]
+    text = f"🃏 Blackjack — Sonuç\n\nSen: {hand_str(player)} ({pv})\nKrupiye: {hand_str(dealer)} ({dv})\n\n{result}"
+    await query.edit_message_text(text)
+
+
+async def bj_callback(update, context):
+    query = update.callback_query
+    try:
+        _, chat_id_s, user_id_s, action = query.data.split(":")
+        chat_id, user_id = int(chat_id_s), int(user_id_s)
+    except Exception:
+        await query.answer()
+        return
+
+    if query.from_user.id != user_id:
+        await query.answer("Bu senin elin değil!", show_alert=True)
+        return
+
+    key = (chat_id, user_id)
+    game = blackjack_games.get(key)
+    if not game:
+        await query.answer("Bu oyun artık aktif değil.", show_alert=True)
+        return
+
+    deck, player, dealer = game["deck"], game["player"], game["dealer"]
+
+    if action == "hit":
+        player.append(deck.pop())
+        if hand_value(player) > 21:
+            await bj_finish(query, key, player, dealer, deck, chat_id, user_id,
+                             query.from_user.first_name, query.from_user.username)
+            await query.answer()
+            return
+        await query.edit_message_text(bj_status_text(player, dealer), reply_markup=bj_keyboard(chat_id, user_id))
+        await query.answer()
+        return
+
+    if action == "stand":
+        await bj_finish(query, key, player, dealer, deck, chat_id, user_id,
+                         query.from_user.first_name, query.from_user.username)
+        await query.answer()
+        return
+
+    await query.answer()
 
 
 # ==================== XOX (tic-tac-toe) ====================
@@ -990,7 +1284,7 @@ HTML = """
     <h1>Bot Yönetim Paneli</h1>
     <p class="sub">Mesaj, aralık, grup, oyun ve koruma ayarlarını buradan yönet</p>
     <div class="status">● Sistem çalışıyor · Aralık: {interval_value} {interval_unit}</div>
-    <div class="status2">🛡 Flood + spam + kelime koruması aktif</div>
+    <div class="status2">🛡 Flood + spam + kelime koruması aktif (yetkililer dahil)</div>
 
     <div class="card">
         <h2>Gönderilecek Mesaj</h2>
@@ -1038,16 +1332,21 @@ HTML = """
                     <input type="number" name="window" value="{flood_window}" min="1">
                 </div>
                 <div>
-                    <label style="font-size:0.8rem;color:#999">Mute (dk, katlanır)</label>
+                    <label style="font-size:0.8rem;color:#999">Link/kelime mute (dk, katlanır)</label>
                     <input type="number" name="mute" value="{flood_mute}" min="1">
                 </div>
             </div>
             <div class="checkline">
                 <input type="checkbox" name="link_block" id="lb" {link_checked}>
-                <label for="lb">Adminler dışında link paylaşımını otomatik sil</label>
+                <label for="lb">Link paylaşımını otomatik sil (yetkililer dahil herkese uygulanır)</label>
             </div>
             <button type="submit">Ayarları Kaydet</button>
         </form>
+        <p style="font-size:0.8rem;color:#666;margin-top:8px">
+            Flood/spam tespit edildiğinde kişinin son tüm mesajları silinir ve sabit <b>10 dakika</b> susturulur
+            (bu süre değiştirilemez, yukarıdaki mute alanı sadece link/kelime ihlalleri içindir). Yetkililer dahil
+            herkese uygulanır — sadece grup sahibi (creator) Telegram kısıtlaması nedeniyle susturulamaz.
+        </p>
     </div>
 
     <div class="card">
@@ -1057,7 +1356,40 @@ HTML = """
             <button type="submit">Kaydet</button>
         </form>
         <p style="font-size:0.8rem;color:#666;margin-top:8px">
-            Bu kelimeleri içeren mesajlar (adminler hariç) otomatik silinir ve gönderen susturulur.
+            Bu kelimeleri içeren mesajlar (yetkililer dahil herkes) otomatik silinir ve gönderen susturulmaya çalışılır.
+        </p>
+    </div>
+
+    <div class="card">
+        <h2>Manuel XP Ver</h2>
+        <form method="post" action="/set_xp">
+            <div class="row">
+                <div>
+                    <label style="font-size:0.8rem;color:#999">Sohbet (Grup) ID</label>
+                    <input type="text" name="chat_id" placeholder="-1001234567890" required>
+                </div>
+                <div>
+                    <label style="font-size:0.8rem;color:#999">Kullanıcı ID</label>
+                    <input type="text" name="user_id" placeholder="123456789" required>
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label style="font-size:0.8rem;color:#999">Kullanıcı adı (opsiyonel)</label>
+                    <input type="text" name="username" placeholder="@kullanici">
+                </div>
+                <div>
+                    <label style="font-size:0.8rem;color:#999">XP miktarı</label>
+                    <input type="number" name="amount" value="100" required>
+                </div>
+            </div>
+            <div class="row">
+                <button type="submit" name="mode" value="add">XP Ekle</button>
+                <button type="submit" name="mode" value="set" style="background:#8e44ad">XP'yi Bu Değere Sabitle</button>
+            </div>
+        </form>
+        <p style="font-size:0.8rem;color:#666;margin-top:8px">
+            Kullanıcı ID'sini öğrenmek için gruptaki kullanıcı bota <code>/id</code> yazabilir (birine reply atarsa onun ID'sini gösterir).
         </p>
     </div>
 
@@ -1073,6 +1405,9 @@ HTML = """
     <div class="card">
         <h2>Komut Listesi</h2>
         <p style="font-size:0.85rem;color:#999;line-height:1.9">
+            <b>Genel</b><br>
+            <code>/id</code> — kendi ID'ni (veya reply attığın kişinin ID'sini) gösterir<br>
+            <code>/bilgi</code> — oyunlar ve XP nasıl kazanılır rehberi<br><br>
             <b>Moderasyon (admin)</b><br>
             <code>/mute 5dakika</code> — reply atılan kişiyi susturur<br>
             <code>/unmute</code> — susturmayı kaldırır<br>
@@ -1090,11 +1425,15 @@ HTML = """
             <code>/xoxbitir</code> — devam eden XOX oyununu iptal eder<br>
             <code>/zar</code> — zar atar<br>
             <code>/yazitura</code> — yazı tura atar<br>
+            <code>/slot</code> — slot makinesi çevirir, 3 sembol tutarsa +15 XP<br>
+            <code>/blackjack</code> — krupiyeye karşı blackjack başlatır<br>
+            <code>/blackjackbitir</code> — devam eden blackjack elini iptal eder<br>
             <code>/sayitahmin</code> — 1-100 arası sayı tahmin oyunu başlatır<br>
             <code>/sayitahminbitir</code> — sayı tahmin oyununu iptal eder<br><br>
-            Flood: {flood_limit} mesaj / {flood_window} sn → otomatik mute (tekrarında süre katlanır)<br>
-            📵 Telefon numarası paylaşımı otomatik silinir + uyarı mesajı atılır<br>
-            🏷 @etiket / mention içeren mesajlar otomatik silinir (uyarısız)
+            Flood/spam: {flood_limit} mesaj / {flood_window} sn → tüm son mesajlar silinir + sabit 10 dakika susturma (yetkililer dahil, grup sahibi hariç)<br>
+            📵 Telefon numarası paylaşımı otomatik silinir + uyarı mesajı atılır (herkese)<br>
+            🏷 @etiket / mention içeren mesajlar otomatik silinir (herkese, uyarısız)<br>
+            🎬 Fotoğraf, sticker, video, GIF ve video not otomatik silinir
         </p>
     </div>
 
@@ -1222,6 +1561,22 @@ async def set_banned_words_web(words: str = Form("")):
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/set_xp")
+async def set_xp_web(chat_id: str = Form(...), user_id: str = Form(...),
+                      username: str = Form(""), amount: int = Form(...), mode: str = Form("add")):
+    try:
+        cid = int(chat_id.strip())
+        uid = int(user_id.strip())
+        uname = username.strip().lstrip("@") or None
+        if mode == "set":
+            set_xp_absolute(cid, uid, uname, amount)
+        else:
+            bump_xp(cid, uid, uname, amount)
+    except Exception as e:
+        print(f"XP verme hatası: {e}")
+    return RedirectResponse("/", status_code=303)
+
+
 @app.post("/add_chat")
 async def add_chat_web(chat_id: str = Form(...)):
     try:
@@ -1251,6 +1606,8 @@ async def main():
     init_db()
     application = Application.builder().token(TOKEN).build()
 
+    application.add_handler(CommandHandler("id", cmd_id))
+    application.add_handler(CommandHandler("bilgi", cmd_bilgi))
     application.add_handler(CommandHandler("mute", cmd_mute))
     application.add_handler(CommandHandler("unmute", cmd_unmute))
     application.add_handler(CommandHandler("kick", cmd_kick))
@@ -1262,11 +1619,15 @@ async def main():
     application.add_handler(CommandHandler("liderlik", cmd_liderlik))
     application.add_handler(CommandHandler("zar", cmd_zar))
     application.add_handler(CommandHandler("yazitura", cmd_yazitura))
+    application.add_handler(CommandHandler("slot", cmd_slot))
+    application.add_handler(CommandHandler("blackjack", cmd_blackjack))
+    application.add_handler(CommandHandler("blackjackbitir", cmd_blackjack_bitir))
     application.add_handler(CommandHandler("sayitahmin", cmd_sayitahmin))
     application.add_handler(CommandHandler("sayitahminbitir", cmd_sayitahmin_bitir))
     application.add_handler(CommandHandler("xox", cmd_xox))
     application.add_handler(CommandHandler("xoxbitir", cmd_xox_bitir))
     application.add_handler(CallbackQueryHandler(xox_callback, pattern=r"^xox:"))
+    application.add_handler(CallbackQueryHandler(bj_callback, pattern=r"^bj:"))
     application.add_handler(MessageHandler(tg_filters.ALL & ~tg_filters.COMMAND, universal_handler))
 
     await application.initialize()
