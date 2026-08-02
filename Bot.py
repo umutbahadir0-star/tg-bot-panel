@@ -25,11 +25,20 @@ flood_tracker = {}       # {(chat_id, user_id): [timestamp, ...]}
 duplicate_tracker = {}   # {(chat_id, user_id): (last_text, tekrar_sayisi)}
 
 LINK_RE = re.compile(r"(https?://|t\.me/|www\.)", re.IGNORECASE)
+PHONE_RE = re.compile(r"[\d][\d\s\-\(\)]{7,}\d")
 UNIT_SECONDS = {"ms": 0.001, "sn": 1, "dk": 60}
 
 
 def to_seconds(value, unit):
     return float(value) * UNIT_SECONDS.get(unit, 1)
+
+
+def contains_phone_number(text):
+    for group in PHONE_RE.findall(text):
+        digits = re.sub(r"\D", "", group)
+        if 10 <= len(digits) <= 13:
+            return True
+    return False
 
 
 # ==================== DB ====================
