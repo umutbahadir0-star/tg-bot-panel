@@ -470,9 +470,31 @@ async def universal_handler(update, context):
             return
 
     if msg.chat.type in ("group", "supergroup"):
-        s = get_settings()
+        if msg.text and contains_phone_number(msg.text):
+            if not await is_admin(context, msg.chat_id, msg.from_user.id):
+                try:
+                    await msg.delete()
+                except Exception as e:
+                    print(f"Telefon numarası silme hatası: {e}")
+                try:
+                    await context.bot.send_message(
+                        msg.chat_id,
+                        f"🚫 {msg.from_user.first_name}, telefon numarası paylaşımı yasak. Mesajın silindi."
+                    )
+                except Exception as e:
+                    print(f"Uyarı gönderme hatası: {e}")
+                return
 
-        if s["link_block"] and msg.text and LINK_RE.search(msg.text):
+        entities = list(msg.entities or []) + list(msg.caption_entities or [])
+        if any(e.type in ("mention", "text_mention") for e in entities):
+            if not await is_admin(context, msg.chat_id, msg.from_user.id):
+                try:
+                    await msg.delete()
+                except Exception as e:
+                    print(f"Etiket silme hatası: {e}")
+                return
+
+        if msg.text and LINK_RE.search(msg.text):
             if not await is_admin(context, msg.chat_id, msg.from_user.id):
                 try:
                     await msg.delete()
@@ -1070,7 +1092,9 @@ HTML = """
             <code>/yazitura</code> — yazı tura atar<br>
             <code>/sayitahmin</code> — 1-100 arası sayı tahmin oyunu başlatır<br>
             <code>/sayitahminbitir</code> — sayı tahmin oyununu iptal eder<br><br>
-            Flood: {flood_limit} mesaj / {flood_window} sn → otomatik mute (tekrarında süre katlanır)
+            Flood: {flood_limit} mesaj / {flood_window} sn → otomatik mute (tekrarında süre katlanır)<br>
+            📵 Telefon numarası paylaşımı otomatik silinir + uyarı mesajı atılır<br>
+            🏷 @etiket / mention içeren mesajlar otomatik silinir (uyarısız)
         </p>
     </div>
 
